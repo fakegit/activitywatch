@@ -7,11 +7,74 @@
 #
 # We recommend creating and activating a Python virtualenv before building.
 # Instructions on how to do this can be found in the guide linked above.
-
-# These targets should always rerun
-.PHONY: build install test clean clean_all
+.PHONY: build install test test-query-parity clean clean_all update-submodules sync-tauri-server screenshots
 
 SHELL := /usr/bin/env bash
+
+OS := $(shell uname -s)
+
+ifeq ($(TAURI_BUILD),true)
+	SUBMODULES := aw-core aw-client aw-server aw-server-rust aw-watcher-afk aw-watcher-window
+	ifeq ($(OS),Linux)
+		# awatcher must be built before aw-tauri so binaries can be staged into
+		# src-tauri/modules/ before the Tauri bundle step runs.
+		SUBMODULES := $(SUBMODULES) awatcher
+	endif
+else
+	SUBMODULES := aw-core aw-client aw-qt aw-server aw-server-rust aw-watcher-afk aw-watcher-window
+	ifeq ($(OS),Linux)
+		# awatcher is the Wayland-capable window/AFK watcher. The PyInstaller
+		# (non-Tauri) Linux bundle ships it as `aw-awatcher`; aw-qt's bundled
+		# module discovery then finds it and can substitute it for
+		# aw-watcher-window on Wayland (aw-qt#142).
+		SUBMODULES := $(SUBMODULES) awatcher
+	endif
+endif
+
+# Exclude aw-server-rust if SKIP_SERVER_RUST is true
+ifeq ($(SKIP_SERVER_RUST),true)
+	SUBMODULES := $(filter-out aw-server-rust,$(SUBMODULES))
+	# awatcher is Rust too, so the legs that skip the Rust toolchain cannot
+	# build it either.
+	SUBMODULES := $(filter-out awatcher,$(SUBMODULES))
+endif
+# Include extras if AW_EXTRAS is true
+ifeq ($(AW_EXTRAS),true)
+	SUBMODULES := $(SUBMODULES) aw-notify aw-watcher-input
+endif
+# aw-tauri goes last, so every module it bundles (awatcher, aw-notify) is built first.
+ifeq ($(TAURI_BUILD),true)
+	SUBMODULES := $(SUBMODULES) aw-tauri
+endif
+
+# A function that checks if a target exists in a Makefile
+# Usage: $(call has_target,<dir>,<target>)
+define has_target
+$(shell make -q -C $1 $2 >/dev/null 2>&1; if [ $$? -eq 0 -o $$? -eq 1 ]; then echo $1; fi)
+endef
+
+# Submodules with test/package/lint/typecheck targets
+TESTABLES := $(foreach dir,$(SUBMODULES),$(call has_target,$(dir),test))
+PACKAGEABLES := $(foreach dir,$(SUBMODULES),$(call has_target,$(dir),package))
+LINTABLES := $(foreach dir,$(SUBMODULES),$(call has_target,$(dir),lint))
+TYPECHECKABLES := $(foreach dir,$(SUBMODULES),$(call has_target,$(dir),typecheck))
+
+# When building with Tauri, aw-server-rust is built as aw-sync only (not full server),
+# so exclude it from the standard package target
+ifeq ($(TAURI_BUILD),true)
+	PACKAGEABLES := $(filter-out aw-server-rust aw-server, $(PACKAGEABLES))
+endif
+# awatcher is copied into dist/activitywatch as a top-level `aw-awatcher` binary
+# below (or staged into aw-tauri's modules/ for Tauri builds), so keep it out of
+# the generic package loop.
+PACKAGEABLES := $(filter-out awatcher,$(PACKAGEABLES))
+
+# Build mode: release vs debug
+ifeq ($(RELEASE), false)
+	targetdir := debug
+else
+	targetdir := release
+endif
 
 # The `build` target
 # ------------------
@@ -19,37 +82,57 @@ SHELL := /usr/bin/env bash
 # What it does:
 #  - Installs all the Python modules
 #  - Builds the web UI and bundles it with aw-server
-#
-# Tips:
-#  - Set the environment variable `PIP_USER=true` for pip to install all Python
-#    packages as user packages (same as `pip install --user <pkg>`). This makes
-#    it possible to install without using a virtualenv (or root).
-build:
-	if [ -e "aw-core/.git" ]; then \
-		echo "Submodules seem to already be initialized, continuing..."; \
-	else \
-		git submodule update --init --recursive; \
-	fi
-#
+build: aw-core/.git
 #	needed due to https://github.com/pypa/setuptools/issues/1963
 #	would ordinarily be specified in pyproject.toml, but is not respected due to https://github.com/pypa/setuptools/issues/1963
 	pip install 'setuptools>49.1.1'
-#
-	make --directory=aw-core build
-	make --directory=aw-client build
-	make --directory=aw-watcher-afk build
-	make --directory=aw-watcher-window build
-	make --directory=aw-server build SKIP_WEBUI=$(SKIP_WEBUI)
-ifndef SKIP_SERVER_RUST  # Skip building aw-server-rust if SKIP_SERVER_RUST is defined
-	echo 'Looking for rust...'
-	if (which cargo); then \
-		echo 'Rust found!'; \
-		make --directory=aw-server-rust build SKIP_WEBUI=$(SKIP_WEBUI); \
-	else \
-		echo 'Rust not found, skipping aw-server-rust!'; \
-	fi
-endif
-	make --directory=aw-qt build
+# Before building aw-tauri, stage aw-sync + awatcher (and aw-notify with
+# AW_EXTRAS) into src-tauri/modules/ on Linux; aw-tauri's Makefile bundles them
+# into the deb/rpm/AppImage when present, as the macOS and Windows Tauri builds
+# already ship them. The dir is wiped first so stale binaries can't leak into a
+# non-Linux or SKIP_SERVER_RUST bundle.
+# Old Tauri bundles are dropped too: a cache-restored target/ can hold a
+# previous version's .deb next to the new one, and aw-tauri's `package` then
+# fails copying `bundle/deb/*.deb` onto a single file.
+	for module in $(SUBMODULES); do \
+		if [ "$(TAURI_BUILD)" = "true" ] && [ "$$module" = "aw-tauri" ]; then \
+			rm -rf aw-tauri/src-tauri/modules || exit 1; \
+			rm -rf aw-tauri/src-tauri/target/release/bundle aw-tauri/src-tauri/target/debug/bundle || exit 1; \
+			if [ "$(OS)" = "Linux" ]; then \
+				echo "Staging bundled modules into aw-tauri/src-tauri/modules/"; \
+				mkdir -p aw-tauri/src-tauri/modules || exit 1; \
+				if [ -f "aw-server-rust/target/$(targetdir)/aw-sync" ]; then \
+					cp aw-server-rust/target/$(targetdir)/aw-sync aw-tauri/src-tauri/modules/aw-sync || exit 1; \
+					chmod +x aw-tauri/src-tauri/modules/aw-sync || exit 1; \
+				elif [ "$(SKIP_SERVER_RUST)" != "true" ]; then \
+					echo "Error: aw-sync binary not found at aw-server-rust/target/$(targetdir)/aw-sync" >&2; \
+					exit 1; \
+				fi; \
+				if [ -f "awatcher/target/$(targetdir)/awatcher" ]; then \
+					cp awatcher/target/$(targetdir)/awatcher aw-tauri/src-tauri/modules/aw-awatcher || exit 1; \
+					chmod +x aw-tauri/src-tauri/modules/aw-awatcher || exit 1; \
+				elif [ "$(SKIP_SERVER_RUST)" != "true" ]; then \
+					echo "Error: awatcher binary not found at awatcher/target/$(targetdir)/awatcher" >&2; \
+					exit 1; \
+				fi; \
+				if [ "$(AW_EXTRAS)" = "true" ]; then \
+					if [ -f "aw-notify/target/$(targetdir)/aw-notify" ]; then \
+						cp aw-notify/target/$(targetdir)/aw-notify aw-tauri/src-tauri/modules/aw-notify || exit 1; \
+						chmod +x aw-tauri/src-tauri/modules/aw-notify || exit 1; \
+					else \
+						echo "Error: aw-notify binary not found at aw-notify/target/$(targetdir)/aw-notify" >&2; \
+						exit 1; \
+					fi; \
+				fi; \
+			fi; \
+		fi; \
+		echo "Building $$module"; \
+		if [ "$$module" = "aw-server-rust" ] && [ "$(TAURI_BUILD)" = "true" ]; then \
+			make --directory=$$module aw-sync SKIP_WEBUI=$(SKIP_WEBUI) || { echo "Error in $$module aw-sync"; exit 2; }; \
+		else \
+			make --directory=$$module build SKIP_WEBUI=$(SKIP_WEBUI) || { echo "Error in $$module build"; exit 2; }; \
+		fi; \
+	done
 #   The below is needed due to: https://github.com/ActivityWatch/activitywatch/issues/173
 	make --directory=aw-client build
 	make --directory=aw-core build
@@ -62,11 +145,13 @@ endif
 #
 # Installs things like desktop/menu shortcuts.
 # Might in the future configure autostart on the system.
+ifneq ($(TAURI_BUILD),true)
 install:
 	make --directory=aw-qt install
 # Installation is already happening in the `make build` step currently.
 # We might want to change this.
 # We should also add some option to install as user (pip3 install --user)
+endif
 
 # Update
 # ------
@@ -77,44 +162,77 @@ update:
 	git submodule update --init --recursive
 	make build
 
+# Move direct submodules to their latest upstream commits. aw-tauri's lockfile
+# is authoritative for the server revision, so align the top-level server
+# submodule with it after updating everything else.
+update-submodules:
+	git submodule update --init --remote
+	git submodule foreach 'git submodule update --init --recursive'
+	$(MAKE) sync-tauri-server
+
+sync-tauri-server:
+	python3 scripts/check_tauri_server.py --sync
+
 
 lint:
-	pylint -E \
-		aw-core/aw_core/ \
-		aw-core/aw_datastore/ \
-		aw-core/aw_transform/ \
-		aw-core/aw_analysis/ \
-		aw-client/aw_client/ \
-		aw-server/aw_server/ \
-		aw-watcher-window/aw_watcher_window/ \
-		aw-watcher-afk/aw_watcher_afk/ \
-		aw-qt/aw_qt/
+	@for module in $(LINTABLES); do \
+		echo "Linting $$module"; \
+		make --directory=$$module lint || { echo "Error in $$module lint"; exit 2; }; \
+	done
+
+typecheck:
+	@for module in $(TYPECHECKABLES); do \
+		echo "Typechecking $$module"; \
+		make --directory=$$module typecheck || { echo "Error in $$module typecheck"; exit 2; }; \
+	done
 
 # Uninstall
 # ---------
 #
 # Uninstalls all the Python modules.
 uninstall:
-	modules=$$(pip3 list --format=legacy | grep 'aw-' | grep -o '^aw-[^ ]*'); \
+	modules=$$(pip3 list --format=freeze | grep '^aw-' | cut -d'=' -f1); \
 	for module in $$modules; do \
 		echo "Uninstalling $$module"; \
 		pip3 uninstall -y $$module; \
 	done
 
 test:
-	make --directory=aw-core test
-	make --directory=aw-client test
-	make --directory=aw-server test
-	make --directory=aw-server-rust test
-	make --directory=aw-qt test
+	@for module in $(TESTABLES); do \
+		echo "Running tests for $$module"; \
+		if [ -f "$$module/pyproject.toml" ]; then \
+			(cd $$module && poetry run make test) || { echo "Error in $$module tests"; exit 2; }; \
+		else \
+			make -C $$module test || { echo "Error in $$module tests"; exit 2; }; \
+		fi; \
+	done
 
 test-integration:
 	# TODO: Move "integration tests" to aw-client
 	# FIXME: For whatever reason the script stalls on Appveyor
 	#        Example: https://ci.appveyor.com/project/ErikBjare/activitywatch/build/1.0.167/job/k1ulexsc5ar5uv4v
-	pytest ./scripts/tests/integration_tests.py ./aw-server/tests/ -v
+	# aw-server-python
+	@echo "== Integration testing aw-server =="
+	@pytest ./scripts/tests/integration_tests.py ./aw-server/tests/ -v
 
-ICON := "aw-qt/media/logo/logo.png"
+# Compares query results of aw-server (Python) and aw-server-rust on identical
+# events. See scripts/tests/query_parity/README.md.
+test-query-parity:
+	python3 -m pytest scripts/tests/query_parity -q -rfX -p no:cacheprovider
+
+# Marketing screenshots of the web UI, from a throwaway aw-server-rust seeded with demo data.
+# Output in dist/screenshots/. Pass options with ARGS, e.g. `make screenshots ARGS="--theme dark"`.
+screenshots:
+	uv run scripts/screenshots.py --build $(ARGS)
+
+%/.git:
+	git submodule update --init --recursive
+
+ifeq ($(TAURI_BUILD),true)
+	ICON := "aw-tauri/src-tauri/icons/icon.png"
+else
+	ICON := "aw-qt/media/logo/logo.png"
+endif
 
 aw-qt/media/logo/logo.icns:
 	mkdir -p build/MyIcon.iconset
@@ -132,35 +250,97 @@ aw-qt/media/logo/logo.icns:
 	rm -R build/MyIcon.iconset
 	mv build/MyIcon.icns aw-qt/media/logo/logo.icns
 
-dist/ActivityWatch.dmg: dist/ActivityWatch.app
-	pip install dmgbuild
-	dmgbuild -s scripts/package/dmgbuild-settings.py -D app=dist/ActivityWatch.app "ActivityWatch" dist/ActivityWatch.dmg
+# Stem of the macOS .app / .dmg. Research Edition patches APP_BUNDLE so the
+# on-disk bundle does not collide with /Applications/ActivityWatch.app.
+APP_BUNDLE ?= ActivityWatch
 
-dist/ActivityWatch.app: aw-qt/media/logo/logo.icns
-	pip install git+git://github.com/pyinstaller/pyinstaller.git@55c8855d9db0fa596ceb28505f3ee2f402ecd4da
-	pyinstaller --clean --noconfirm --windowed aw.spec
+dist/$(APP_BUNDLE).app: aw-qt/media/logo/logo.icns
+ifeq ($(TAURI_BUILD),true)
+	scripts/package/build_app_tauri.sh
+else
+	pyinstaller --clean --noconfirm aw.spec
+endif
+
+dist/$(APP_BUNDLE).dmg: dist/$(APP_BUNDLE).app
+	# NOTE: This does not codesign the dmg, that is done in the CI config
+	pip install dmgbuild
+	@for attempt in 1 2 3; do \
+		rm -f dist/$(APP_BUNDLE).dmg; \
+		if dmgbuild -s scripts/package/dmgbuild-settings.py -D app=dist/$(APP_BUNDLE).app "$(APP_BUNDLE)" dist/$(APP_BUNDLE).dmg; then \
+			exit 0; \
+		fi; \
+		if [ $$attempt -eq 3 ]; then \
+			exit 1; \
+		fi; \
+		echo "dmgbuild attempt $$attempt failed; retrying after macOS releases the disk image" >&2; \
+		sleep $$((5 * attempt)); \
+	done
+
+dist/notarize:
+	./scripts/notarize.sh
 
 package:
+	rm -rf dist
 	mkdir -p dist/activitywatch
-#
-	make --directory=aw-watcher-afk package
-	cp -r aw-watcher-afk/dist/aw-watcher-afk dist/activitywatch
-#
-	make --directory=aw-watcher-window package
-	cp -r aw-watcher-window/dist/aw-watcher-window dist/activitywatch
-#
-	make --directory=aw-server package
-	cp -r aw-server/dist/aw-server dist/activitywatch
-ifndef SKIP_SERVER_RUST
-	make --directory=aw-server-rust package
+	for dir in $(PACKAGEABLES); do \
+		make --directory=$$dir package || { echo "Error in $$dir package"; exit 2; }; \
+		cp -r $$dir/dist/$$dir dist/activitywatch || exit 2; \
+	done
+ifeq ($(TAURI_BUILD),true)
+# Copy aw-sync binary for Tauri builds
 	mkdir -p dist/activitywatch/aw-server-rust
-	cp -r aw-server-rust/target/package/* dist/activitywatch/aw-server-rust
+	cp aw-server-rust/target/$(targetdir)/aw-sync dist/activitywatch/aw-server-rust/aw-sync
+else
+# Move aw-qt to the root of the dist folder
+# Rename first to avoid cp conflict: the aw-qt binary inside the dir has the
+# same name as the source directory, so cp -a src/. dest/ would fail trying
+# to overwrite the directory with the binary of the same name.
+	mv dist/activitywatch/aw-qt dist/aw-qt-tmp
+	cp -a dist/aw-qt-tmp/. dist/activitywatch/
+	rm -rf dist/aw-qt-tmp
+ifeq ($(OS),Linux)
+ifneq ($(SKIP_SERVER_RUST),true)
+# Ship the Wayland-capable watcher in the bundle. aw-qt discovers bundled
+# modules by scanning its own directory for executables named aw-*, so the
+# binary has to sit at the top level as `aw-awatcher`. Fail closed: a Linux
+# bundle without it silently records nothing on Wayland.
+	@test -x awatcher/target/$(targetdir)/awatcher || { \
+		echo "Error: awatcher binary not found at awatcher/target/$(targetdir)/awatcher (required for Wayland support in the Linux bundle)" >&2; \
+		exit 1; \
+	}
+	cp awatcher/target/$(targetdir)/awatcher dist/activitywatch/aw-awatcher
+	chmod +x dist/activitywatch/aw-awatcher
 endif
-	make --directory=aw-qt package
-	cp -r aw-qt/dist/aw-qt/. dist/activitywatch
-# Remove problem-causing binaries, see https://github.com/ActivityWatch/activitywatch/issues/161
-	rm -f dist/activitywatch/libdrm.so.2
-# Remove unecessary files
+endif
+endif
+# Remove problem-causing binaries
+	rm -f dist/activitywatch/libdrm.so.2       # see: https://github.com/ActivityWatch/activitywatch/issues/161
+	rm -f dist/activitywatch/libharfbuzz.so.0  # see: https://github.com/ActivityWatch/activitywatch/issues/660#issuecomment-959889230
+ifeq ($(shell uname),Linux)
+# Libraries that must match the host ABI, never bundled. PyInstaller copies
+# whatever the build host has — glib 2.72 on the ubuntu-22.04 runner, glib 2.56
+# in the manylinux_2_28 image — and the bundled copies then shadow the user's
+# newer system libraries. All portable Linux packages are built from this
+# directory, so remove them here and use the distro library instead.
+#   - libwayland-client: libQt6WaylandClient needs wl_proxy_marshal_flags
+#     (libwayland >= 1.20) and otherwise crashes on startup with
+#     "undefined symbol: wl_proxy_marshal_flags". See:
+#     https://github.com/ActivityWatch/activitywatch/issues/939
+#     and https://github.com/ActivityWatch/activitywatch/issues/1105
+#   - libgio/libglib/libgobject: a bundled libgio cannot read the host's
+#     GSettings schemas. See:
+#     https://github.com/ActivityWatch/activitywatch/issues/710
+	find dist/activitywatch -maxdepth 1 \
+		\( -name 'libwayland-client.so*' -o -name 'libwayland-cursor.so*' \
+		-o -name 'libwayland-egl.so*' -o -name 'libgio-2.0.so*' \
+		-o -name 'libglib-2.0.so*' -o -name 'libgobject-2.0.so*' \) -delete
+endif
+# These should be provided by the distro itself
+# Had to be removed due to otherwise causing the error:
+#   aw-qt: symbol lookup error: /opt/activitywatch/libQt5XcbQpa.so.5: undefined symbol: FT_Get_Font_Format
+	rm -f dist/activitywatch/libfontconfig.so.1
+	rm -f dist/activitywatch/libfreetype.so.6
+# Remove unnecessary files
 	rm -rf dist/activitywatch/pytz
 # Builds zips and setups
 	bash scripts/package/package-all.sh
@@ -170,13 +350,9 @@ clean:
 
 # Clean all subprojects
 clean_all: clean
-	make --directory=aw-client clean
-	make --directory=aw-core clean
-	make --directory=aw-qt clean
-	make --directory=aw-server clean
-	make --directory=aw-watcher-afk clean
-	make --directory=aw-watcher-window clean
-	make --directory=aw-server-rust clean
+	for dir in $(SUBMODULES); do \
+		make --directory=$$dir clean; \
+	done
 
 clean-auto:
 	rm -rIv **/aw-server-rust/target
